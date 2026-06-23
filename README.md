@@ -1,52 +1,45 @@
 # SQLite Deployment Safety Lab
 
-Reproduces the real-world SQLite production issues from the Hacker News discussion "SQLite in Production: Lessons from Running a Store on a Single File" (HN #47637353).
+Demonstrates real-world SQLite deployment issues from HN #47637353.
 
-## Quick Start
+## Experiments
+
+1. **01_wal_concurrency.py** - Proves SQLite allows only ONE writer at a time
+2. **02_overlapping_deploys.py** - Simulates the Ultrathink bug (3 containers, lost writes)
+3. **03_checkpoint_behavior.py** - Long readers block checkpoints, WAL grows
+4. **04_unsafe_backup.py** - `cp` vs `.backup` API safety
+5. **05_busy_timeout.py** - How `timeout: 5000` actually works
+
+## Running
 
 ```bash
-git clone https://github.com/necat101/sqlite-deployment-safety-lab.git
-cd sqlite-deployment-safety-lab
-python3 tests/01_wal_basics.py
-python3 tests/02_concurrent_writers.py
-python3 tests/04_checkpoints.py
+./run_all.sh
 ```
-
-## The Hacker News Debate
-
-**The Problem:** A production e-commerce store lost 2 orders after 11 deploys in 2 hours. `sqlite_sequence` showed IDs 16 and 17 allocated, but `MAX(id)` returned 15.
-
-**Root Cause:** Blue-green deploys with overlapping containers mounting the same Docker volume created 3+ concurrent writers to the same WAL file.
-
-**The Fix:** GitHub Actions concurrency controls + safe backup methods.
-
-## Tests
-
-1. **01_wal_basics.py** - WAL mode fundamentals
-2. **02_concurrent_writers.py** - Simulates overlapping containers
-3. **03_deploy_simulation.py** - Blue-green deploy overlap
-4. **04_checkpoints.py** - Checkpoint starvation demo
-5. **05_backup_safety.py** - `cp` vs `.backup` API
-6. **06_busy_handling.py** - SQLITE_BUSY strategies
 
 ## Key Findings
 
-- WAL enables concurrent readers but NOT concurrent writers
-- `sqlite_sequence` gaps reveal lost transactions
-- Long-running readers block checkpoints (WAL grows without bound)
-- `cp` backups are unsafe - use `.backup` API
-- `timeout: 5000` is a band-aid, not a fix
+Validated with real test output:
 
-## Full Documentation
+- **WAL != multi-writer**: Even with WAL, only 1 writer at a time. Concurrent writers get SQLITE_BUSY (Experiment 1: 2 of 5 writers failed)
+- **Overlapping deploys lose data**: Multiple containers writing to same DB = contention (Experiment 2)
+- **Checkpoints blocked**: Long-running transactions prevent WAL truncation, files grow to 400KB+ in seconds (Experiment 3)
+- **cp is unsafe**: Copying live DB can create corrupt backups with torn pages (Experiment 4)
+- **Timeout is a band-aid**: Writers wait up to timeout, then fail. Doesn't solve root cause (Experiment 5)
 
-See [RESULTS.md](RESULTS.md) for detailed test results and analysis.
+## The Fix
 
-## The Verdict
+```yaml
+# .github/workflows/deploy.yml
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false  # Queue, don't cancel
+```
 
-SQLite works for single-server deployments **IF**:
-- GitHub Actions concurrency prevents overlapping deploys
-- Backups use `.backup` API (not `cp`)
-- Write volume is moderate
-- You monitor for SQLITE_BUSY
+Prevents overlapping deploys that caused the original bug.
 
-The HN author's lost orders were a **deployment process failure**, not a SQLite failure.
+## References
+
+- [HN Thread](https://news.ycombinator.com/item?id=47637353)
+- [Ultrathink Article](https://ultrathink.art/blog/sqlite-in-production-lessons)
+- [SQLite WAL](https://sqlite.org/wal.html)
+- [How to Corrupt](https://sqlite.org/howtocorrupt.html)
