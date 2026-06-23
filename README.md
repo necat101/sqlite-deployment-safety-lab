@@ -1,45 +1,68 @@
 # SQLite Deployment Safety Lab
 
-Demonstrates real-world SQLite deployment issues from HN #47637353.
+Demonstrates real-world SQLite deployment issues from [HN #47637353](https://news.ycombinator.com/item?id=47637353) about running SQLite in production.
 
-## Experiments
+## The HN Debate Summary
 
-1. **01_wal_concurrency.py** - Proves SQLite allows only ONE writer at a time
-2. **02_overlapping_deploys.py** - Simulates the Ultrathink bug (3 containers, lost writes)
-3. **03_checkpoint_behavior.py** - Long readers block checkpoints, WAL grows
-4. **04_unsafe_backup.py** - `cp` vs `.backup` API safety
-5. **05_busy_timeout.py** - How `timeout: 5000` actually works
+**The incident**: Ultrathink.art lost 2 orders after **11 pushes in 2 hours** with overlapping Kamal deploys. Three containers simultaneously accessed the same SQLite WAL file on a shared Docker volume. Orders 16 and 17 succeeded in Stripe but never made it to the database.
 
-## Running
+**HN discussion themes**:
+- **Operational failure, not SQLite failure**: Pushing straight to main, agents auto-deploying, no deploy serialization
+- **WAL shared-memory across containers**: Debated whether mmap'd `-shm` files work reliably across Docker containers (they do, via the shared volume)
+- **Single-writer limitation**: Many commenters clarified WAL allows concurrent readers but NOT concurrent writers
+- **Process termination risk**: Overlapping deploys + SIGTERM mid-transaction = data loss
+- **Backup safety**: `cp` vs SQLite's `.backup` API - raw copies can be corrupt
+
+## Current Experiments
+
+### ✅ Experiment 1: WAL Concurrency Limits (`experiments/01_wal_concurrency.py`)
+**Status**: Validated  
+**Proves**: SQLite allows only ONE writer at a time, even in WAL mode. Concurrent writers get SQLITE_BUSY.
+
+**Real output**:
+```
+Summary: 3 succeeded, 2 failed
+Final row count: 4 (expected 6)
+Lost writes: 2
+```
+
+### 🚧 Experiments 2-5: In Progress
+The following experiments are planned but not yet committed:
+- `02_overlapping_deploys.py` - Blue-green deploy simulation
+- `03_checkpoint_behavior.py` - WAL growth with long-running readers  
+- `04_unsafe_backup.py` - `cp` vs `.backup` API
+- `05_busy_timeout.py` - SQLITE_BUSY timeout behavior
+
+## Running the Lab
 
 ```bash
-./run_all.sh
+git clone https://github.com/necat101/sqlite-deployment-safety-lab.git
+cd sqlite-deployment-safety-lab
+python3 experiments/01_wal_concurrency.py
+# Or run all: ./run_all.sh
 ```
 
-## Key Findings
+## Key Takeaways
 
-Validated with real test output:
-
-- **WAL != multi-writer**: Even with WAL, only 1 writer at a time. Concurrent writers get SQLITE_BUSY (Experiment 1: 2 of 5 writers failed)
-- **Overlapping deploys lose data**: Multiple containers writing to same DB = contention (Experiment 2)
-- **Checkpoints blocked**: Long-running transactions prevent WAL truncation, files grow to 400KB+ in seconds (Experiment 3)
-- **cp is unsafe**: Copying live DB can create corrupt backups with torn pages (Experiment 4)
-- **Timeout is a band-aid**: Writers wait up to timeout, then fail. Doesn't solve root cause (Experiment 5)
-
-## The Fix
-
-```yaml
-# .github/workflows/deploy.yml
-concurrency:
-  group: production-deploy
-  cancel-in-progress: false  # Queue, don't cancel
-```
-
-Prevents overlapping deploys that caused the original bug.
+1. **SQLite WAL ≠ Multi-writer**: WAL enables concurrent readers + single writer. Writes are serialized.
+2. **Deploy serialization is mandatory**: Use GitHub Actions concurrency:
+   ```yaml
+   concurrency:
+     group: production-deploy
+     cancel-in-progress: false
+   ```
+3. **Never use `cp` for backups**: Use `sqlite3 db ".backup backup.db"` or the backup API
+4. **Monitor WAL size**: Long-running readers block checkpoints, causing unbounded growth
+5. **Handle SQLITE_BUSY**: With `timeout: 5000`, writers wait 5s then fail. App must retry or handle the error.
 
 ## References
 
-- [HN Thread](https://news.ycombinator.com/item?id=47637353)
-- [Ultrathink Article](https://ultrathink.art/blog/sqlite-in-production-lessons)
-- [SQLite WAL](https://sqlite.org/wal.html)
-- [How to Corrupt](https://sqlite.org/howtocorrupt.html)
+- [HN Thread #47637353](https://news.ycombinator.com/item?id=47637353)
+- [Ultrathink: SQLite in Production](https://ultrathink.art/blog/sqlite-in-production-lessons)
+- [SQLite WAL Mode](https://sqlite.org/wal.html)
+- [How to Corrupt SQLite](https://sqlite.org/howtocorrupt.html)
+- [GitHub Actions: Control Workflow Concurrency](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)
+
+## Validation Status
+
+See [VALIDATED_RESULTS.md](VALIDATED_RESULTS.md) for detailed test output from local execution.
